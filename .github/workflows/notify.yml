@@ -9,7 +9,7 @@ on:
   workflow_dispatch:
 
 jobs:
-  run_signal_check:
+  run_bot:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
@@ -20,12 +20,11 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Run signal check once
+      - name: Run signal check
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           TRADE_SYMBOL: "BTCUSDT"
-          TRADE_INTERVAL: "15m"
           RUN_ONCE: "1"
         run: python3 send_signal.py
 
