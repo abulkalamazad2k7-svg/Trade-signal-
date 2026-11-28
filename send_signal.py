@@ -6,7 +6,9 @@ from urllib import parse, request
 
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
+TWELVE_DATA_KEY = os.environ.get("TWELVE_DATA_API_KEY", "").strip()
 SYMBOL = os.environ.get("TRADE_SYMBOL", "BTCUSDT").strip().upper()
+TD_SYMBOL = os.environ.get("TWELVE_DATA_SYMBOL", "BTC/USD").strip().upper()
 POLL_SECONDS = int(os.environ.get("POLL_SECONDS", "15"))
 ONCE = os.environ.get("RUN_ONCE", "0").strip() in ("1", "true", "yes")
 STATE_FILE = os.environ.get("STATE_FILE", "signal_state.json")
@@ -21,6 +23,15 @@ ENDPOINTS = [
     "https://api2.binance.com/api/v3/klines",
     "https://api3.binance.com/api/v3/klines",
 ]
+
+TD_INTERVAL_MAP = {
+    "1m": ("1min", 60),
+    "5m": ("5min", 300),
+    "15m": ("15min", 900),
+    "30m": ("30min", 1800),
+    "1h": ("1h", 3600),
+    "1d": ("1day", 86400),
+}
 
 
 def current_month_key(dt: datetime) -> str:
@@ -78,6 +89,58 @@ def send_telegram_message(text: str) -> None:
             raise RuntimeError(f"Telegram HTTP {resp.status}")
 
 
+def _parse_td_datetime_ms(dt_str: str) -> int:
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+        try:
+            dt = datetime.strptime(dt_str.strip(), fmt).replace(tzinfo=timezone.utc)
+            return int(dt.timestamp() * 1000)
+        except ValueError:
+            continue
+    raise ValueError(f"Unrecognized Twelve Data datetime: {dt_str}")
+
+
+def fetch_twelve_data_klines(interval: str, limit: int = 80) -> list:
+    if not TWELVE_DATA_KEY:
+        raise RuntimeError("TWELVE_DATA_API_KEY not set")
+    td_iv, sec_span = TD_INTERVAL_MAP.get(interval, ("1min", 60))
+    query = parse.urlencode(
+        {
+            "symbol": TD_SYMBOL,
+            "interval": td_iv,
+            "outputsize": str(limit),
+            "timezone": "UTC",
+            "apikey": TWELVE_DATA_KEY,
+        }
+    )
+    url = f"https://api.twelvedata.com/time_series?{query}"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36",
+        "Accept": "application/json",
+    }
+    req = request.Request(url, headers=headers)
+    with request.urlopen(req, timeout=15) as resp:
+        payload = json.loads(resp.read().decode("utf-8"))
+
+    if not isinstance(payload, dict) or payload.get("status") == "error" or "values" not in payload:
+        raise RuntimeError(f"Twelve Data error: {payload.get('message', payload)}")
+
+    rows = list(reversed(payload["values"]))
+    out = []
+    for r in rows:
+        open_ms = _parse_td_datetime_ms(r["datetime"])
+        close_ms = open_ms + (sec_span * 1000) - 1
+        o_val = float(r["open"])
+        h_val = float(r["high"])
+        l_val = float(r["low"])
+        c_val = float(r["close"])
+        v_val = float(r.get("volume") or 1.0)
+        out.append([open_ms, o_val, h_val, l_val, c_val, v_val, close_ms])
+
+    if len(out) < 35:
+        raise RuntimeError("Twelve Data returned insufficient candles")
+    return out
+
+
 def fetch_klines(interval: str, limit: int = 80) -> list:
     last_err = None
     headers = {
@@ -95,7 +158,11 @@ def fetch_klines(interval: str, limit: int = 80) -> list:
                         return data
         except Exception as exc:
             last_err = exc
-    raise RuntimeError(f"Market fetch failed ({interval}): {last_err}")
+
+    try:
+        return fetch_twelve_data_klines(interval, limit=limit)
+    except Exception as td_exc:
+        raise RuntimeError(f"Market fetch failed ({interval}): binance={last_err} | twelvedata={td_exc}")
 
 
 def ema(values: list[float], period: int) -> list[float]:
@@ -199,12 +266,6 @@ def evaluate_signal(klines: list, use_forming: bool = True) -> dict | None:
 
 
 def check_trigger_mode(tf: str, klines: list, now_ms: int) -> tuple[str | None, int]:
-    """
-    Returns (mode, event_ms):
-    - "CLOSE_1M": within final 65s before candle close (or first 20m of new 1d open)
-    - "NEW_SETUP": fresh signal setup on current forming candle outside close window
-    - (None, event_ms): not due
-    """
     forming_open_ms = int(klines[-1][0])
     forming_close_ms = int(klines[-1][6])
 
@@ -290,7 +351,6 @@ def run_cycle() -> None:
         if not sig:
             continue
 
-        # Avoid duplicate alerts for the same candle/side/mode
         sig_key = f"{mode}:{tf}:{event_ms}:{sig['side']}"
         close_key = f"CLOSE_1M:{tf}:{event_ms}:{sig['side']}"
         if sig_key in state["sent_keys"] or (mode == "NEW_SETUP" and close_key in state["sent_keys"]):
