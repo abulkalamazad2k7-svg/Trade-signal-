@@ -1,15 +1,36 @@
-name: Notify Telegram on GitHub Push
+name: Trade Signal & Push Notify
 
 on:
   push:
     branches:
       - main
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
 
 jobs:
-  notify:
+  run_signal_check:
     runs-on: ubuntu-latest
     steps:
-      - name: Send Telegram confirmation
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Run signal check once
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TRADE_SYMBOL: "BTCUSDT"
+          TRADE_INTERVAL: "15m"
+          RUN_ONCE: "1"
+        run: python3 send_signal.py
+
+      - name: Send push notification if triggered by push
+        if: github.event_name == 'push'
         env:
           BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
@@ -18,11 +39,7 @@ jobs:
             echo "Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID"
             exit 1
           fi
-          MSG="🚀 NEW REPO UPLOAD CONFIRMED
-Repo: ${{ github.repository }}
-Branch: main
-Commit: ${{ github.sha }}"
+          MSG="PUSH UPDATED: ${{ github.repository }} (${{ github.sha }})"
           curl -fsS -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
             --data-urlencode "chat_id=${CHAT_ID}" \
             --data-urlencode "text=${MSG}"
-          echo "Telegram notification sent!"
