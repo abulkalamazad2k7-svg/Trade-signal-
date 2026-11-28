@@ -198,20 +198,26 @@ def evaluate_signal(klines: list, use_forming: bool = True) -> dict | None:
     }
 
 
-def is_due_now(tf: str, klines: list, now_ms: int) -> tuple[bool, bool, int]:
+def check_trigger_mode(tf: str, klines: list, now_ms: int) -> tuple[str | None, int]:
+    """
+    Returns (mode, event_ms):
+    - "CLOSE_1M": within final 65s before candle close (or first 20m of new 1d open)
+    - "NEW_SETUP": fresh signal setup on current forming candle outside close window
+    - (None, event_ms): not due
+    """
     forming_open_ms = int(klines[-1][0])
     forming_close_ms = int(klines[-1][6])
 
     if tf == "1d":
         elapsed_since_day_open = now_ms - forming_open_ms
         if 0 <= elapsed_since_day_open <= 1_200_000:
-            return True, True, forming_open_ms
-        return False, True, forming_open_ms
+            return "CLOSE_1M", forming_open_ms
+        return "NEW_SETUP", forming_open_ms
 
     ms_left = forming_close_ms - now_ms
     if 0 < ms_left <= 65_000:
-        return True, True, forming_close_ms
-    return False, True, forming_close_ms
+        return "CLOSE_1M", forming_close_ms
+    return "NEW_SETUP", forming_close_ms
 
 
 def settle_open_trades(state: dict, klines_1m: list) -> None:
@@ -276,16 +282,18 @@ def run_cycle() -> None:
         settle_open_trades(state, klines_by_tf["1m"])
 
     for tf, klines in klines_by_tf.items():
-        due, use_forming, event_ms = is_due_now(tf, klines, now_ms)
-        if not due:
+        mode, event_ms = check_trigger_mode(tf, klines, now_ms)
+        if not mode:
             continue
 
-        sig_key = f"SIG:{tf}:{event_ms}"
-        if sig_key in state["sent_keys"]:
-            continue
-
-        sig = evaluate_signal(klines, use_forming=use_forming)
+        sig = evaluate_signal(klines, use_forming=True)
         if not sig:
+            continue
+
+        # Avoid duplicate alerts for the same candle/side/mode
+        sig_key = f"{mode}:{tf}:{event_ms}:{sig['side']}"
+        close_key = f"CLOSE_1M:{tf}:{event_ms}:{sig['side']}"
+        if sig_key in state["sent_keys"] or (mode == "NEW_SETUP" and close_key in state["sent_keys"]):
             continue
 
         state["total_signals"] += 1
@@ -304,9 +312,10 @@ def run_cycle() -> None:
         target_bd = datetime.fromtimestamp(event_ms / 1000.0, tz=BD_TZ)
         target_str = target_bd.strftime("%Y-%m-%d %I:%M %p BD")
         sent_str = now_bd.strftime("%Y-%m-%d %I:%M:%S %p BD")
+        tag = "FINAL-1M" if mode == "CLOSE_1M" else "LIVE-SETUP"
 
         msg = (
-            f"🎯 TRADE SIGNAL ({tf} @ {target_str}): {sig['side']}\n"
+            f"🎯 TRADE SIGNAL [{tag}] ({tf} @ {target_str}): {sig['side']}\n"
             f"Pair: {SYMBOL}\n"
             f"Entry: {sig['entry']:.2f}\n"
             f"Stop Loss: {sig['sl']:.2f}\n"
@@ -318,8 +327,8 @@ def run_cycle() -> None:
         )
         send_telegram_message(msg)
 
-    if len(state["sent_keys"]) > 600:
-        state["sent_keys"] = state["sent_keys"][-600:]
+    if len(state["sent_keys"]) > 800:
+        state["sent_keys"] = state["sent_keys"][-800:]
 
     save_state(state)
     print(
