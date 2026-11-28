@@ -1,15 +1,12 @@
-name: Trade Signal & Push Notify
+name: Trade Signal Monitor
 
 on:
-  push:
-    branches:
-      - main
   schedule:
-    - cron: "*/15 * * * *"
+    - cron: "*/5 * * * *"
   workflow_dispatch:
 
 jobs:
-  run_bot:
+  run-signal:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
@@ -20,25 +17,12 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Run signal check
+      - name: Run signal check once
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          TRADE_SYMBOL: "BTCUSDT"
+          TWELVE_DATA_API_KEY: ${{ secrets.TWELVE_DATA_API_KEY }}
+          TRADE_SYMBOL: BTCUSDT
+          TWELVE_DATA_SYMBOL: BTC/USD
           RUN_ONCE: "1"
         run: python3 send_signal.py
-
-      - name: Send push notification if triggered by push
-        if: github.event_name == 'push'
-        env:
-          BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: |
-          if [ -z "$BOT_TOKEN" ] || [ -z "$CHAT_ID" ]; then
-            echo "Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID"
-            exit 1
-          fi
-          MSG="PUSH UPDATED: ${{ github.repository }} (${{ github.sha }})"
-          curl -fsS -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
-            --data-urlencode "chat_id=${CHAT_ID}" \
-            --data-urlencode "text=${MSG}"
