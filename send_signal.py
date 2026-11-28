@@ -1,7 +1,7 @@
 import json
 import os
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from urllib import parse, request
 
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
@@ -11,6 +11,7 @@ POLL_SECONDS = int(os.environ.get("POLL_SECONDS", "15"))
 ONCE = os.environ.get("RUN_ONCE", "0").strip() in ("1", "true", "yes")
 STATE_FILE = os.environ.get("STATE_FILE", "signal_state.json")
 
+BD_TZ = timezone(timedelta(hours=6))
 TIMEFRAMES = ["1m", "5m", "15m", "30m", "1h", "1d"]
 
 ENDPOINTS = [
@@ -23,7 +24,7 @@ ENDPOINTS = [
 
 
 def current_month_key(dt: datetime) -> str:
-    return dt.strftime("%Y-%m")
+    return dt.astimezone(BD_TZ).strftime("%Y-%m")
 
 
 def load_state(now_dt: datetime) -> dict:
@@ -198,11 +199,6 @@ def evaluate_signal(klines: list, use_forming: bool = True) -> dict | None:
 
 
 def is_due_now(tf: str, klines: list, now_ms: int) -> tuple[bool, bool, int]:
-    """
-    Returns (should_check, use_forming_candle, target_event_ms).
-    - Intraday TFs (1m, 5m, 15m, 30m, 1h): triggers during final 65s before candle close.
-    - Daily TF (1d): triggers near day start (within first 20m of new daily open candle).
-    """
     forming_open_ms = int(klines[-1][0])
     forming_close_ms = int(klines[-1][6])
 
@@ -265,6 +261,7 @@ def format_monthly_footer(state: dict) -> str:
 
 def run_cycle() -> None:
     now_dt = datetime.now(timezone.utc)
+    now_bd = now_dt.astimezone(BD_TZ)
     now_ms = int(now_dt.timestamp() * 1000)
     state = load_state(now_dt)
 
@@ -304,9 +301,9 @@ def run_cycle() -> None:
         )
         state["sent_keys"].append(sig_key)
 
-        target_dt = datetime.fromtimestamp(event_ms / 1000.0, tz=timezone.utc)
-        target_str = target_dt.strftime("%Y-%m-%d %H:%M UTC")
-        now_str = now_dt.strftime("%Y-%m-%d %H:%M:%S UTC")
+        target_bd = datetime.fromtimestamp(event_ms / 1000.0, tz=BD_TZ)
+        target_str = target_bd.strftime("%Y-%m-%d %I:%M %p BD")
+        sent_str = now_bd.strftime("%Y-%m-%d %I:%M:%S %p BD")
 
         msg = (
             f"🎯 TRADE SIGNAL ({tf} @ {target_str}): {sig['side']}\n"
@@ -315,7 +312,8 @@ def run_cycle() -> None:
             f"Stop Loss: {sig['sl']:.2f}\n"
             f"Take Profit: {sig['tp']:.2f}\n"
             f"RSI(14): {sig['rsi']:.1f}\n"
-            f"Sent At: {now_str}"
+            f"Sent At: {sent_str}\n"
+            f"UTC Ref: {now_dt.strftime('%H:%M:%S UTC')}"
             f"{format_monthly_footer(state)}"
         )
         send_telegram_message(msg)
@@ -325,7 +323,7 @@ def run_cycle() -> None:
 
     save_state(state)
     print(
-        f"[{now_dt.strftime('%H:%M:%S UTC')}] Done | "
+        f"[{now_bd.strftime('%I:%M:%S %p BD')}] Done | "
         f"Total={state['total_signals']} W={state['wins']} L={state['losses']}"
     )
 
