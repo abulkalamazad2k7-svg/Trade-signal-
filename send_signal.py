@@ -7,21 +7,11 @@ from urllib import parse, request
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 SYMBOL = os.environ.get("TRADE_SYMBOL", "BTCUSDT").strip().upper()
-POLL_SECONDS = int(os.environ.get("POLL_SECONDS", "20"))
+POLL_SECONDS = int(os.environ.get("POLL_SECONDS", "15"))
 ONCE = os.environ.get("RUN_ONCE", "0").strip() in ("1", "true", "yes")
 STATE_FILE = os.environ.get("STATE_FILE", "signal_state.json")
 
-TIMEFRAMES = ["1m", "5m", "15m", "30m", "1h", "4h", "1d", "1w"]
-INTERVAL_MS = {
-    "1m": 60_000,
-    "5m": 300_000,
-    "15m": 900_000,
-    "30m": 1_800_000,
-    "1h": 3_600_000,
-    "4h": 14_400_000,
-    "1d": 86_400_000,
-    "1w": 604_800_000,
-}
+TIMEFRAMES = ["1m", "5m", "15m", "30m", "1h", "1d"]
 
 ENDPOINTS = [
     "https://data-api.binance.vision/api/v3/klines",
@@ -145,59 +135,56 @@ def atr(highs: list[float], lows: list[float], closes: list[float], period: int 
     return val if val > 0 else max(closes[-1] * 0.002, 0.5)
 
 
-def analyze_series(klines: list, use_forming_candle: bool = False) -> dict:
-    # Closed candles exclude the still-forming last kline unless pre-signal uses live forming candle
-    base_klines = klines if use_forming_candle else klines[:-1]
-    closes = [float(c[4]) for c in base_klines]
-    highs = [float(c[2]) for c in base_klines]
-    lows = [float(c[3]) for c in base_klines]
-    volumes = [float(c[5]) for c in base_klines]
+def evaluate_signal(klines: list, use_forming: bool = True) -> dict | None:
+    series = klines if use_forming else klines[:-1]
+    closes = [float(c[4]) for c in series]
+    highs = [float(c[2]) for c in series]
+    lows = [float(c[3]) for c in series]
+    volumes = [float(c[5]) for c in series]
+
+    if len(closes) < 25:
+        return None
 
     ema_fast = ema(closes, 9)
     ema_mid = ema(closes, 21)
     ema_trend = ema(closes, 50) if len(closes) >= 50 else ema_mid
     cur_rsi = rsi(closes, 14)
     cur_atr = atr(highs, lows, closes, 14)
-    avg_vol = sum(volumes[-20:]) / max(1, min(20, len(volumes)))
+    avg_vol = sum(volumes[-21:-1]) / max(1, min(20, len(volumes) - 1))
     vol_ratio = volumes[-1] / avg_vol if avg_vol > 0 else 1.0
 
     price = closes[-1]
-    bull_score = 0.0
-    bear_score = 0.0
+    open_ms = int(series[-1][0])
+    close_ms = int(series[-1][6])
 
-    if ema_fast[-1] > ema_mid[-1]:
-        bull_score += 1.5
-    else:
-        bear_score += 1.5
+    buy_ok = (
+        ema_fast[-1] > ema_mid[-1]
+        and ema_fast[-1] >= ema_fast[-2]
+        and price > ema_mid[-1]
+        and price >= ema_trend[-1] * 0.999
+        and 50.0 <= cur_rsi <= 75.0
+        and vol_ratio >= 0.85
+    )
 
-    if price > ema_trend[-1]:
-        bull_score += 1.5
-    else:
-        bear_score += 1.5
+    sell_ok = (
+        ema_fast[-1] < ema_mid[-1]
+        and ema_fast[-1] <= ema_fast[-2]
+        and price < ema_mid[-1]
+        and price <= ema_trend[-1] * 1.001
+        and 25.0 <= cur_rsi <= 50.0
+        and vol_ratio >= 0.85
+    )
 
-    if ema_fast[-1] > ema_fast[-2] and ema_mid[-1] >= ema_mid[-2]:
-        bull_score += 1.0
-    elif ema_fast[-1] < ema_fast[-2] and ema_mid[-1] <= ema_mid[-2]:
-        bear_score += 1.0
-
-    if 45.0 <= cur_rsi <= 72.0:
-        bull_score += 1.0
-    if 28.0 <= cur_rsi <= 55.0:
-        bear_score += 1.0
-
-    if vol_ratio >= 0.9:
-        bull_score += 0.5
-        bear_score += 0.5
-
-    # Always resolve to BUY or SELL (never WAIT)
-    if bull_score >= bear_score:
+    if buy_ok:
         side = "BUY"
         sl = price - (cur_atr * 1.5)
         tp = price + (cur_atr * 2.5)
-    else:
+    elif sell_ok:
         side = "SELL"
         sl = price + (cur_atr * 1.5)
         tp = price - (cur_atr * 2.5)
+    else:
+        return None
 
     return {
         "side": side,
@@ -205,10 +192,30 @@ def analyze_series(klines: list, use_forming_candle: bool = False) -> dict:
         "sl": sl,
         "tp": tp,
         "rsi": cur_rsi,
-        "atr": cur_atr,
-        "open_time": int(base_klines[-1][0]),
-        "close_time": int(base_klines[-1][6]),
+        "open_time": open_ms,
+        "close_time": close_ms,
     }
+
+
+def is_due_now(tf: str, klines: list, now_ms: int) -> tuple[bool, bool, int]:
+    """
+    Returns (should_check, use_forming_candle, target_event_ms).
+    - Intraday TFs (1m, 5m, 15m, 30m, 1h): triggers during final 65s before candle close.
+    - Daily TF (1d): triggers near day start (within first 20m of new daily open candle).
+    """
+    forming_open_ms = int(klines[-1][0])
+    forming_close_ms = int(klines[-1][6])
+
+    if tf == "1d":
+        elapsed_since_day_open = now_ms - forming_open_ms
+        if 0 <= elapsed_since_day_open <= 1_200_000:
+            return True, True, forming_open_ms
+        return False, True, forming_open_ms
+
+    ms_left = forming_close_ms - now_ms
+    if 0 < ms_left <= 65_000:
+        return True, True, forming_close_ms
+    return False, True, forming_close_ms
 
 
 def settle_open_trades(state: dict, klines_1m: list) -> None:
@@ -233,7 +240,7 @@ def settle_open_trades(state: dict, klines_1m: list) -> None:
                     state["wins"] += 1
                     resolved = True
                     break
-            else:  # SELL
+            else:
                 if c_high >= tr["sl"]:
                     state["losses"] += 1
                     resolved = True
@@ -271,39 +278,19 @@ def run_cycle() -> None:
     if "1m" in klines_by_tf:
         settle_open_trades(state, klines_by_tf["1m"])
 
-    # 1) Pre-signal 1 minute before candle close (e.g. minute 21 for minute 22)
     for tf, klines in klines_by_tf.items():
-        forming_close_ms = int(klines[-1][6])
-        ms_left = forming_close_ms - now_ms
-        if 0 < ms_left <= 65_000:
-            pre_key = f"PRE:{tf}:{forming_close_ms}"
-            if pre_key not in state["sent_keys"]:
-                pred = analyze_series(klines, use_forming_candle=True)
-                msg = (
-                    f"⏳ PRE-SIGNAL ({tf} closing soon)\n"
-                    f"Pair: {SYMBOL}\n"
-                    f"Next Bias: {pred['side']}\n"
-                    f"Est. Entry: {pred['entry']:.2f}\n"
-                    f"SL: {pred['sl']:.2f} | TP: {pred['tp']:.2f}"
-                    f"{format_monthly_footer(state)}"
-                )
-                send_telegram_message(msg)
-                state["sent_keys"].append(pre_key)
+        due, use_forming, event_ms = is_due_now(tf, klines, now_ms)
+        if not due:
+            continue
 
-    # 2) Confirmed closed-candle signals across all requested timeframes (including weekly start)
-    is_week_start = (now_dt.weekday() == 0 and now_dt.hour < 6)
-    for tf, klines in klines_by_tf.items():
-        closed_candle = klines[-2]
-        closed_close_ms = int(closed_candle[6])
-        sig_key = f"SIG:{tf}:{closed_close_ms}"
+        sig_key = f"SIG:{tf}:{event_ms}"
         if sig_key in state["sent_keys"]:
             continue
 
-        # On 1w, prioritize early week window or fresh weekly close
-        if tf == "1w" and not is_week_start and (now_ms - closed_close_ms) > 86_400_000:
+        sig = evaluate_signal(klines, use_forming=use_forming)
+        if not sig:
             continue
 
-        sig = analyze_series(klines, use_forming_candle=False)
         state["total_signals"] += 1
         state["open_trades"].append(
             {
@@ -312,27 +299,29 @@ def run_cycle() -> None:
                 "entry": sig["entry"],
                 "sl": sig["sl"],
                 "tp": sig["tp"],
-                "entry_close_time": closed_close_ms,
+                "entry_close_time": event_ms,
             }
         )
         state["sent_keys"].append(sig_key)
 
-        ts_str = now_dt.strftime("%Y-%m-%d %H:%M:%S UTC")
+        target_dt = datetime.fromtimestamp(event_ms / 1000.0, tz=timezone.utc)
+        target_str = target_dt.strftime("%Y-%m-%d %H:%M UTC")
+        now_str = now_dt.strftime("%Y-%m-%d %H:%M:%S UTC")
+
         msg = (
-            f"🎯 TRADE SIGNAL: {sig['side']}\n"
-            f"Pair: {SYMBOL} ({tf})\n"
+            f"🎯 TRADE SIGNAL ({tf} @ {target_str}): {sig['side']}\n"
+            f"Pair: {SYMBOL}\n"
             f"Entry: {sig['entry']:.2f}\n"
             f"Stop Loss: {sig['sl']:.2f}\n"
             f"Take Profit: {sig['tp']:.2f}\n"
             f"RSI(14): {sig['rsi']:.1f}\n"
-            f"Time: {ts_str}"
+            f"Sent At: {now_str}"
             f"{format_monthly_footer(state)}"
         )
         send_telegram_message(msg)
 
-    # Keep sent_keys bounded
-    if len(state["sent_keys"]) > 500:
-        state["sent_keys"] = state["sent_keys"][-500:]
+    if len(state["sent_keys"]) > 600:
+        state["sent_keys"] = state["sent_keys"][-600:]
 
     save_state(state)
     print(
